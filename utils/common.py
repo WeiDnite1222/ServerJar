@@ -8,6 +8,16 @@ PAPER_SERVER_JAR_API = "https://api.papermc.io/v2/projects/paper/versions/{}/bui
 MOJANG_VERSION_MANIFEST_V2 = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
 
+def jar_filename(filename: str | None, default: str) -> str:
+    if filename:
+        name = filename
+        if not name.endswith(".jar"):
+            name += ".jar"
+        return name
+
+    return default
+
+
 def download_file(url: str, destination: Path, chunk_size: int = 1024 * 512):
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -70,9 +80,53 @@ def get_version_list(release=True):
                         "Error: {}".format(MOJANG_VERSION_MANIFEST_V2, e))
 
 
+def get_version_manifest():
+    try:
+        r = requests.get(MOJANG_VERSION_MANIFEST_V2)
+
+        if r.status_code == 200:
+            return r.json()
+
+        raise Exception("Unable to fetch version manifest.\n"
+                        "Response: {}".format(r.text))
+    except requests.exceptions.RequestException as e:
+        raise Exception("Unable to get version manifest from server.\n"
+                        "URL: {}\n"
+                        "Error: {}".format(MOJANG_VERSION_MANIFEST_V2, e))
+
+
+def get_minecraft_version_metadata(minecraft_version: str):
+    manifest = get_version_manifest()
+    version_info = next(
+        (version for version in manifest.get("versions", []) if version.get("id") == minecraft_version),
+        None,
+    )
+
+    if version_info is None:
+        raise Exception(f"Minecraft version {minecraft_version} was not found in Mojang version manifest.")
+
+    try:
+        r = requests.get(version_info["url"])
+
+        if r.status_code == 200:
+            return r.json()
+
+        raise Exception("Unable to fetch Minecraft version metadata for {}.\n"
+                        "Response: {}".format(minecraft_version, r.text))
+    except requests.exceptions.RequestException as e:
+        raise Exception("Unable to get Minecraft version metadata from server.\n"
+                        "URL: {}\n"
+                        "Error: {}".format(version_info.get("url"), e))
+
+
 def get_latest_version_minecraft(release=True):
     version_list = get_version_list(release=release)
-    ver = version_list[0] if version_list else None
+    if not version_list:
+        ver = None
+    elif release:
+        ver = version_list[0]
+    else:
+        ver = version_list[0].get("id")
 
     if ver is None:
         raise Exception("Unable to find latest version in version list.\n")
@@ -86,12 +140,7 @@ def download_server_jar(minecraft_version: str, build_version: str, destination:
     """
     url = PAPER_SERVER_JAR_API.format(minecraft_version, build_version, minecraft_version, build_version)
 
-    if filename:
-        jar_name = filename
-        if not jar_name.endswith(".jar"):
-            jar_name += ".jar"
-    else:
-        jar_name = os.path.basename(url)
+    jar_name = jar_filename(filename, os.path.basename(url))
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination = Path(destination, jar_name)
@@ -153,3 +202,29 @@ def download_latest_paper_jar(destination_dir: Path, filename: str | None = None
     latest_mc = vers[0]
 
     return download_latest_build_paper_jar(latest_mc, destination_dir, filename=filename)
+
+
+def download_vanilla_server_jar(minecraft_version: str, destination: Path, filename: str | None = None):
+    """
+    Download a vanilla Minecraft server jar from Mojang's version manifest.
+    """
+    metadata = get_minecraft_version_metadata(minecraft_version)
+    server_download = metadata.get("downloads", {}).get("server")
+
+    if not server_download or not server_download.get("url"):
+        raise Exception(f"Minecraft version {minecraft_version} does not provide a vanilla server jar.")
+
+    url = server_download["url"]
+    jar_name = jar_filename(filename, f"minecraft_server.{minecraft_version}.jar")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = Path(destination, jar_name)
+
+    try:
+        download_file(url, destination)
+        return destination
+    except Exception as e:
+        raise Exception("Unable to download vanilla server jar for version {}\nURL: {}\nError: {}".format(
+            minecraft_version,
+            url,
+            e,
+        ))
