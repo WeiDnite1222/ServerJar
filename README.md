@@ -1,3 +1,3 @@
 # ServerJar
 
-Create/Manage multiple Mineraft server all in one tool.
+Create/Manage multiple Minecraft server all in one tool.
