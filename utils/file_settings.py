@@ -270,9 +270,15 @@ class FileSettings:
     def _validate_dict_form(self, sample, target):
         for k, v in sample.items():
             if target.get(k, None) is None:
-                target[k] = v
+                target[k] = copy.deepcopy(v)
             elif isinstance(v, dict) and isinstance(target.get(k, None), dict):
                 target[k] = self._validate_dict_form(v, target.get(k, {}))
+            elif type(target.get(k, None)) is not type(v):
+                candidate = target[k].get("default") if isinstance(target[k], dict) else None
+                if type(candidate) is type(v):
+                    target[k] = copy.deepcopy(candidate)
+                else:
+                    target[k] = copy.deepcopy(v)
 
         return target
 

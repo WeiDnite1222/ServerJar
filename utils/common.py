@@ -9,7 +9,7 @@ MOJANG_VERSION_MANIFEST_V2 = "https://piston-meta.mojang.com/mc/game/version_man
 
 
 def download_file(url: str, destination: Path, chunk_size: int = 1024 * 512):
-    destination.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     with requests.get(url, stream=True, timeout=30) as r:
         if r.status_code != 200:
@@ -17,7 +17,7 @@ def download_file(url: str, destination: Path, chunk_size: int = 1024 * 512):
 
         total = int(r.headers.get("content-length", 0))
 
-        with destination.open(mode="wb", buffering=chunk_size).write(r.content) as f:
+        with destination.open(mode="wb", buffering=chunk_size) as f:
             if total > 0:
                 with click.progressbar(length=total, label=f"Downloading {os.path.basename(destination)}") as bar:
                     for chunk in r.iter_content(chunk_size=chunk_size):
@@ -72,7 +72,7 @@ def get_version_list(release=True):
 
 def get_latest_version_minecraft(release=True):
     version_list = get_version_list(release=release)
-    ver = version_list[0].get("id") if version_list else None
+    ver = version_list[0] if version_list else None
 
     if ver is None:
         raise Exception("Unable to find latest version in version list.\n")
@@ -115,6 +115,31 @@ def download_latest_build_paper_jar(minecraft_version: str, destination_dir: Pat
     build = get_latest_build_of_version(minecraft_version)
     return download_server_jar(minecraft_version, build, destination_dir, filename=filename)
 
+def version_exist_from_paper(minecraft_version: str) -> bool:
+    try:
+        get_specific_version_paper_builds(minecraft_version)
+        return True
+    except Exception:
+        return False
+
+
+def get_latest_paper_version(release) -> str:
+    vers = get_version_list(release=release)
+    index = 0
+    latest_paper_support_ver = None
+
+    while latest_paper_support_ver is None:
+        if len(vers) < index+1:
+            raise Exception("No supported Minecraft version available for Paper support.")
+
+        if version_exist_from_paper(minecraft_version=vers[index]):
+            latest_paper_support_ver = vers[index]
+            break
+
+        index+=1
+
+    return latest_paper_support_ver
+
 
 def download_latest_paper_jar(destination_dir: Path, filename: str | None = None, release: bool = True):
     """
@@ -126,4 +151,5 @@ def download_latest_paper_jar(destination_dir: Path, filename: str | None = None
         raise Exception("No versions available for Minecraft (Did the server return wrong response ?)")
 
     latest_mc = vers[0]
+
     return download_latest_build_paper_jar(latest_mc, destination_dir, filename=filename)

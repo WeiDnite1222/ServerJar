@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import queue
+import ssl
 import sys
 import threading
 import socket
@@ -30,6 +31,9 @@ class ServerJarClient(Application):
         })
         # Socket
         self.sock = None
+
+        # Args
+        self.args = None
 
         # event
         self.kb = KeyBindings()
@@ -281,8 +285,9 @@ class ServerJarClient(Application):
     def arguments_parser(self):
         parser = argparse.ArgumentParser()
 
-        # parser.add_argument("-p", "--port", type=int, help="Port number", required=True)
-        # parser.add_argument('-host', '--host', type=str, help="Hostname", required=True)
+        parser.add_argument("-p", "--port", type=int, help="Port number", required=True)
+        parser.add_argument('-host', '--host', type=str, help="Hostname", required=True)
+        parser.add_argument('-no-tls', '--no-tls', type="store_true", help="Enable TLS support")
 
         args = parser.parse_args()
 
@@ -374,7 +379,16 @@ class ServerJarClient(Application):
 
             try:
                 self._log(f"Connecting to {self.host}:{self.port} ...")
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+                # Create connect
+                if self.args.no_tls:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.connect((self.host, self.port))
+                else:
+                    raw = socket.create_connection((self.host, self.port))
+                    context = ssl.create_default_context()
+                    s = context.wrap_socket(raw, server_hostname=self.host)
+
                 s.connect((self.host, self.port))
 
                 with self.sock_lock:
@@ -421,7 +435,7 @@ class ServerJarClient(Application):
 
 
     def startup(self):
-        self.arguments_parser()
+        self.args = self.arguments_parser()
         self.layout.focus(self.input_area)
         asyncio.create_task(self.consume_incoming())
 

@@ -10,89 +10,38 @@ import socketserver
 import logging
 import os
 import queue
+import ssl
 import sys
 import subprocess
 import threading
 import time
+import datetime
 from pathlib import Path
 import click
 import yaml
 from utils.common import download_latest_paper_jar, get_latest_version_minecraft, get_specific_version_paper_builds, \
-    download_server_jar, download_latest_build_paper_jar
+    download_server_jar, download_latest_build_paper_jar, get_latest_paper_version
 from utils.file_settings import FileSettings
 from utils.file_settings import required_list, required_value
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
 
 ROOT_DIR = Path(os.getcwd())
 SERVER_CONFIG_PATH = ROOT_DIR / "config" / "server.yml"
-
+VERSION = "1.0"
 
 def exit(message):
     click.echo(click.style(message, fg='green'))
+    sys.exit(0)
 
 
 @click.group()
 def main():
-    print("ServerJar\n"
-          "WorkDir: {}".format(ROOT_DIR))
-
-
-@main.command()
-@click.option("--name", "-d", default="Unnamed Server", show_default=True, help="Server name")
-@click.option("--mc-version", "-m",
-              default=None,
-              help="Specify Minecraft version to download (If not specified, download latest Minecraft version)",
-              required=False)
-@click.option("--build", "-b", default=None,
-              help="Specify paper build to download (Use latest Minecraft version if not specified)")
-@click.option("--snapshot", is_flag=True,
-              help="Download snapshot version Minecraft (Use it if the current mc-version type is snapshot)")
-@click.option("--latest", is_flag=True, help="Download latest Minecraft version (With latest build paper)")
-@click.option("--list-builds", is_flag=True, help="List available paper build versions")
-@click.option("--filename", default=None, help="Custom SERVER.jar file name")
-def create_server(name, mc_version, build, snapshot, latest, list_builds, filename):
-    server_dir = Path("servers", name)
-
-    if server_dir.exists():
-        result = str(input("Found existing server dir. Do you want to overwrite it and continue? [y/N] "))
-
-        if not result.lower() == "y":
-            exit("User aborted.")
-
-    server_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        release = True if not snapshot else False
-        if latest:
-            click.echo("Fetching latest Mojang release version...")
-            out = download_latest_paper_jar(server_dir, filename=filename, release=release)
-            click.echo(f"Done: {out}")
-            return
-
-        if mc_version is None:
-            click.echo("The mc-version is not specified. Fetching latest Minecraft release version...")
-            mc_version = get_latest_version_minecraft(release=release)
-
-        if list_builds:
-            builds = get_specific_version_paper_builds(mc_version)
-            if not builds:
-                click.echo(f"No builds found for Paper {mc_version}")
-                return
-            click.echo(f"Paper {mc_version} builds:")
-            click.echo(", ".join(map(str, builds[-20:])))
-            click.echo("(Only list latest 20 builds)")
-            return
-
-        if build:
-            click.echo(f"Downloading Paper {mc_version} build {build} ...")
-            out = download_server_jar(mc_version, str(build), server_dir, filename=filename)
-            click.echo(f"Done: {out}")
-        else:
-            click.echo(f"Downloading latest Paper build for {mc_version} ...")
-            out = download_latest_build_paper_jar(mc_version, server_dir, filename=filename)
-            click.echo(f"Done: {out}")
-
-    except Exception as e:
-        raise click.ClickException(str(e))
+    print(f"ServerJar v{VERSION}"
+          f"\nWorkDir: {ROOT_DIR}")
 
 
 def load_settings():
@@ -106,12 +55,15 @@ def load_settings():
         {
             "socketServerHostname": required_value("127.0.0.1"),
             "socketServerPort": required_value(25560),
+            "enableTLSSupport": required_value(True),
+            "socketServerCertfile": required_value("data/server-public.pem"),
+            "socketServerKeyfile": required_value("data/server-private.pem"),
             "servers": required_list(
                 {
                     "name": "Unnamed Server",
                     "version": "unknown",
                     "description": "",
-                    "command": "",
+                    "args": [],
                     "workDir": "",
                     "port": 25565,
                     "host": "127.0.0.1",
@@ -133,14 +85,22 @@ def load_settings():
 
 
 @main.command()
-@click.option("--server-folder-path", "-sf",
-              help="The destination of the folder", required=True)
-@click.option("--server-jar-path", "-sp",
-              help="The destination of the SERVER.jar", required=True)
-@click.option("--socket-server-host", "-srh",
-              help="Hostname of the socket server", required=True)
-@click.option("--socket-server-port", "-srp",
-              help="Port of the socket server", required=True)
+@click.option("--name", "-d", default="Unnamed Server", show_default=True, help="Server name")
+@click.option("--mc-version", "-m",
+              default=None,
+              help="Specify Minecraft version to download (If not specified, download latest Minecraft version)",
+              required=False)
+@click.option("--build", "-b", default=None,
+              help="Specify paper build to download (Use latest Minecraft version if not specified)")
+@click.option("--snapshot", is_flag=True,
+              help="Download snapshot version Minecraft (Use it if the current mc-version type is snapshot)")
+@click.option("--latest", is_flag=True, help="Download latest Minecraft version (With latest build paper)")
+@click.option("--list-builds", is_flag=True, help="List available paper build versions")
+@click.option("--filename", default=None, help="Custom SERVER.jar file name")
+@click.option("--extra-args", "-e",
+              help="Extra java arguments", type=str, default="")
+@click.option("--custom-args", "-ce",
+              help="Custom arguments (command)", type=str, default="")
 @click.option("--java-exec-path", "-p", show_default=True,
               help="The destination of the java executable", default="java")
 @click.option("--x-memory-initial", "-xms", show_default=True,
@@ -152,18 +112,62 @@ def load_settings():
 @click.option("--nogui", "-ng",
               help="Disable server window",
               is_flag=True)
-@click.option("--extra-args", "-e",
-              help="Extra java arguments", type=str, default="")
-@click.option("--custom-commands", "-cd",
-              help="Custom run commands", type=str, default="")
-def create_bootstrap(server_folder_path, server_jar_path, socket_server_host, socket_server_port,
-                     java_exec_path, x_memory_initial, x_memory_maximum, nogui, extra_args, custom_commands):
+@click.option("--server-host", "-srh",
+              help="Hostname of the server", required=True)
+@click.option("--server-port", "-srp",
+              help="Port of the server", required=True)
+def create_server(name, mc_version, build, snapshot, latest, list_builds, filename, extra_args, java_exec_path,
+                  x_memory_initial, x_memory_maximum, nogui, custom_args, server_port, server_host):
+    server_dir = Path("servers", name)
+
+    if server_dir.exists():
+        result = str(input("Found existing server dir. Do you want to overwrite it and continue? [y/N] "))
+
+        if not result.lower() == "y":
+            exit("User aborted.")
+
+    server_dir.mkdir(parents=True, exist_ok=True)
+
+    latest_ver = None
+
+    try:
+        release = True if not snapshot else False
+        if latest:
+            click.echo("Fetching latest Mojang release version...")
+            latest_ver = get_latest_paper_version(release=release)
+            builds = get_specific_version_paper_builds(latest_ver)
+            out = download_server_jar(latest_ver, builds[-1], server_dir)
+        else:
+            if mc_version is None:
+                click.echo("The mc-version is not specified. Fetching latest Minecraft release version...")
+                mc_version = get_latest_version_minecraft(release=release)
+
+            if list_builds:
+                builds = get_specific_version_paper_builds(mc_version)
+                if not builds:
+                    click.echo(f"No builds found for Paper {mc_version}")
+                    return
+                click.echo(f"Paper {mc_version} builds:")
+                click.echo(", ".join(map(str, builds[-20:])))
+                click.echo("(Only list latest 20 builds)")
+                return
+
+            if build:
+                click.echo(f"Downloading Paper {mc_version} build {build} ...")
+                out = download_server_jar(mc_version, str(build), server_dir, filename=filename)
+                click.echo(f"Done: {out}")
+            else:
+                click.echo(f"Downloading latest Paper build for {mc_version} ...")
+                out = download_latest_build_paper_jar(mc_version, server_dir, filename=filename)
+                click.echo(f"Done: {out}")
+
+    except Exception as e:
+        raise click.ClickException(str(e))
 
     settings = load_settings()
 
     print("There's some information you need to fill for server config.")
-    name = str(input("New server name: "))
-    version = str(input("Server version: "))
+    name = str(input("New server name: ")) if name is None else name
     desc = str(input("Server description: "))
 
     found_exist = False
@@ -175,33 +179,41 @@ def create_bootstrap(server_folder_path, server_jar_path, socket_server_host, so
         result = str(input("WARNING: Found duplicate server name. Would you like to continue? [y/N] "))
         if not result.lower() == "y":
             exit("User aborted.")
+            return
 
-    extra_args += " nogui" if nogui else ""
-    cmd = f"{java_exec_path} -Xms{x_memory_initial} -Xmx{x_memory_maximum} -jar {server_jar_path} {extra_args}"
+    extra_args += "nogui" if nogui else ""
+    args = [
+        java_exec_path,
+        "--Xms{}".format(x_memory_initial),
+        "--Xmx{}".format(x_memory_maximum),
+        "-jar",
+        out.absolute().as_posix(),
+        extra_args,
+    ]
 
-    if custom_commands:
+    if custom_args:
         print("Will use custom commands as replacement.")
-        cmd = custom_commands
+        args = custom_args
 
-    print(f"Server command: {cmd}")
+    print(f"Server command: {" ".join(args)}")
 
     with settings.edit() as s:
         print("Saving...")
         s["servers"].append({
             "name": name,
-            "version": version,
+            "version": latest_ver if latest_ver is not None else mc_version,
             "description": desc,
-            "command": cmd,
-            "workDir": server_folder_path,
-            "port": socket_server_port,
-            "host": socket_server_host,
+            "args": args,
+            "workDir": server_dir.absolute().as_posix(),
+            "port": server_port,
+            "host": server_host,
             "enable": True,
         })
 
     print("Done")
 
 class SocketServer:
-    def __init__(self, host, port):
+    def __init__(self, host, port, enable_tls, certfile: Path, keyfile: Path):
         self.logger = logging.getLogger("SocketServer")
         self.stdout_handler = logging.StreamHandler(sys.stdout)
         self.stdout_handler.setFormatter(logging.Formatter("%(level)s:%(message)s"))
@@ -220,6 +232,18 @@ class SocketServer:
         self._sub_lock = threading.Lock()
 
         self.command_receivers = {}
+        self.enable_tls = enable_tls
+        self.certfile = certfile
+        self.keyfile = keyfile
+
+        if not self.certfile.exists():
+            raise FileNotFoundError("Certfile not found")
+
+        if not self.keyfile.exists():
+            raise FileNotFoundError("Keyfile not found")
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
 
     # -------------------------
     # Socket Server
@@ -253,6 +277,12 @@ class SocketServer:
     def _build_tcp_server(self):
         manager = self
 
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        except ssl.SSLError as e:
+            self.logger.fatal("SSL error", exc_info=e)
+
         class TCPServer(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
             daemon_threads = True
@@ -260,6 +290,14 @@ class SocketServer:
             def __init__(self, server_address, RequestHandlerClass):
                 super().__init__(server_address, RequestHandlerClass)
                 self.manager = manager
+
+                if self.manager.enable_tls:
+                    def get_request():
+                        sock, addr = super().get_request()
+                        tls_sock = context.wrap_socket(sock, server_side=True)
+                        return tls_sock, addr
+
+                    self.get_request = get_request
 
         class Handler(socketserver.BaseRequestHandler):
             current_server_record = {
@@ -442,7 +480,7 @@ class SocketServer:
         return None
 
 class Server:
-    def __init__(self, name, version, description, command, work_dir, port, host, enable):
+    def __init__(self, name, version, description, args, work_dir, port, host, enable):
         self._stdout_thread = None
 
         # Process
@@ -464,14 +502,14 @@ class Server:
         self.logger = logging.getLogger(name)
         self.logger.setLevel(logging.INFO)
         self.stdout_handler = logging.StreamHandler(sys.stdout)
-        self.stdout_handler.setFormatter(logging.Formatter("[%(asctime)s:%(level)s]: %(message)s"))
+        self.stdout_handler.setFormatter(logging.Formatter(f"[%(asctime)s:%(levelname)s:{name}]: %(message)s"))
         self.logger.addHandler(self.stdout_handler)
 
         # Values from config
         self.name = name
         self.version = version
         self.description = description
-        self.command = command
+        self.args = args
         self.work_dir = work_dir
         self.port = port
         self.host = host
@@ -489,14 +527,12 @@ class Server:
                 self.logger.warning("[PROC] already running, skip")
                 return
 
-            args = shlex.split(self.command)
-            if not args:
-                raise ValueError(f"Server \"{self.name}\" command is empty.")
+            if len(self.args) == 0:
+                raise Exception("[SYS] No arguments provided")
 
-            self.logger.info("[PROC] spawning: %s", self.command)
-
+            self.logger.info("[PROC] spawning: %s", " ".join(self.args))
             self.proc = subprocess.Popen(
-                args,
+                self.args,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -634,7 +670,7 @@ def load_all_server_from_settings(settings: FileSettings):
                 name=server_conf.get("name"),
                 version=server_conf.get("version"),
                 description=server_conf.get("description"),
-                command=server_conf.get("command"),
+                args=server_conf.get("args",[]),
                 work_dir=server_conf.get("workDir"),
                 port=server_conf.get("port"),
                 host=server_conf.get("host"),
@@ -647,7 +683,7 @@ def load_all_server_from_settings(settings: FileSettings):
 @main.command()
 def runserver():
     logger = logging.getLogger(__name__)
-    formatter = logging.Formatter('%(asctime)s:%(levelname)s: %(message)s')
+    formatter = logging.Formatter('[%(asctime)s:%(levelname)s:runServer]: %(message)s')
     logger.setLevel(logging.INFO)
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(formatter)
@@ -659,10 +695,11 @@ def runserver():
     logger.info("{} servers available".format(len(servers)))
 
     # Socket
-    logger.info("Starting socket server")
     socket_server = SocketServer(settings.get("socketServerHostname", "127.0.0.1"),
-                                 settings.get("socketServerPort", 25560))
-    socket_server.start_socket_server()
+                                 settings.get("socketServerPort", 25560),
+                                 settings.get("enableTLSSupport", True),
+                                 Path(settings.get("socketServerCertfile", "data/server.crt")),
+                                 Path(settings.get( "socketServerKeyfile", "data/server.key")))
 
     # Flags
     stop_once = False
@@ -693,46 +730,107 @@ def runserver():
     )
 
     # Boot server
-    logger.info("Starting server")
-    for server in servers:
-        if server.enable:
-            server.register_broadcaster(socket_server.publish_log)
-            socket_server.register_command_receiver(server.name, server.command_receiver,
-                                                    server.process_command_receiver)
-            try:
-                server.start()
-            except Exception as e:
-                logger.error(f"Server {server.name} failed to start: {e}")
+    if len(servers) != 0:
+        logger.info("Starting socket server")
+        socket_server.start_socket_server()
+
+        logger.info("Starting server")
+        for server in servers:
+            if server.enable:
+                server.register_broadcaster(socket_server.publish_log)
+                socket_server.register_command_receiver(server.name, server.command_receiver,
+                                                        server.process_command_receiver)
+                try:
+                    server.start()
+                except Exception as e:
+                    logger.error(f"Server {server.name} failed to start: {e}")
+                else:
+                    logger.info(f"Server {server.name} started.")
             else:
-                logger.info(f"Server {server.name} started.")
-        else:
-            logger.info(f"Server {server.name} is disabled.")
-    try:
-        stop = False
+                logger.info(f"Server {server.name} is disabled.")
+        try:
+            stop = False
 
-        while not stop:
-            if socket_server.stop_event.is_set():
-                logger.info("Remote stop event triggered. Stopping...")
-                cleanup()
-                stop = True
-                continue
+            while not stop:
+                if socket_server.stop_event.is_set():
+                    logger.info("Remote stop event triggered. Stopping...")
+                    cleanup()
+                    stop = True
+                    continue
 
-            for server in list(servers):
-                if server.running and not server.is_process_alive():
-                    logger.info(f"Server {server.name} stopped.")
-                    server.running = False
+                for server in list(servers):
+                    if server.running and not server.is_process_alive():
+                        logger.info(f"Server {server.name} stopped.")
+                        server.running = False
 
-            if servers and not any(server.running for server in servers):
-                cleanup()
-                stop = True
-                continue
+                if servers and not any(server.running for server in servers):
+                    cleanup()
+                    stop = True
+                    continue
 
-            time.sleep(0.5)
-    except KeyboardInterrupt:
-        logger.info("Stopping server...")
-        cleanup()
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            logger.info("Stopping server...")
+            cleanup()
+    else:
+        logger.info("No work to do.")
+
+    settings.save()
 
     logger.info("Stopped!")
+
+@main.command()
+def generate_tls_key():
+    print("Generating TLS key...")
+    key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+    )
+
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"California"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, u"San Francisco"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"My Dev Org"),
+        x509.NameAttribute(NameOID.COMMON_NAME, u"localhost"),
+    ])
+
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        key.public_key()
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.datetime.now(datetime.UTC)
+    ).not_valid_after(
+        # Valid for 1 year
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
+    ).add_extension(
+        x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
+        critical=False,
+    ).sign(key, hashes.SHA256())
+
+    private_key = Path("data/server-private.pem")
+    public_key = Path("data/server-public.pem")
+    private_key.parent.mkdir(parents=True, exist_ok=True)
+    public_key.parent.mkdir(parents=True, exist_ok=True)
+
+    with private_key.open("wb") as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+
+    with public_key.open("wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    print("Private key saved to {}".format(private_key))
+    print("Public key saved to {}".format(public_key))
+    print("Done.")
 
 
 if __name__ == "__main__":
