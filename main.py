@@ -4,7 +4,6 @@ ServerJar
 Wei - 2026
 """
 import re
-import shlex
 import signal
 import socketserver
 import logging
@@ -21,7 +20,7 @@ import hmac
 from pathlib import Path
 import click
 import yaml
-from utils.common import download_latest_paper_jar, get_latest_version_minecraft, get_specific_version_paper_builds, \
+from utils.common import get_latest_version_minecraft, get_specific_version_paper_builds, \
     download_server_jar, download_latest_build_paper_jar, get_latest_paper_version, download_vanilla_server_jar
 from utils.file_settings import FileSettings
 from utils.file_settings import required_list, required_value
@@ -33,7 +32,7 @@ from cryptography.hazmat.primitives import serialization
 
 ROOT_DIR = Path(os.getcwd())
 SERVER_CONFIG_PATH = ROOT_DIR / "config" / "server.yml"
-VERSION = "1.0"
+VERSION = "1.1"
 LOG_DIR_NAME = "logs"
 SERVERJAR_LOG_FILE = "serverjar.log"
 LOG_DOWNLOAD_CHUNK_SIZE = 4096
@@ -41,7 +40,6 @@ LOG_DOWNLOAD_CHUNK_SIZE = 4096
 def exit(message):
     click.echo(click.style(message, fg='green'))
     sys.exit(0)
-
 
 @click.group()
 def main():
@@ -243,6 +241,12 @@ def create_server(name, mc_version, build, server_type, snapshot, latest, list_b
 
     print("Done")
 
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.clients = []
+        self.clients_lock = threading.Lock()
+
 class SocketServer:
     def __init__(self, host, port, enable_tls, certfile: Path, keyfile: Path, password: str = ""):
         self.logger = logging.getLogger("SocketServer")
@@ -259,7 +263,7 @@ class SocketServer:
         self.host = host
         self.port = port
 
-        self._tcp_server: socketserver.ThreadingTCPServer | None = None
+        self.tcp_server: ThreadedTCPServer | None = None
         self._tcp_thread: threading.Thread | None = None
 
         self._log_subscribers: set[queue.Queue] = set()
@@ -293,14 +297,16 @@ class SocketServer:
     # -------------------------
     def publish_log(self, server_name: str, line: str | None = None):
         if line is None:
+            log_server = None
             message = server_name
         else:
+            log_server = server_name
             message = f"[{server_name}] {line}"
 
         with self._sub_lock:
             for q in list(self._log_subscribers):
                 try:
-                    q.put_nowait(message)
+                    q.put_nowait((log_server, message))
                 except queue.Full:
                     pass
 
@@ -316,9 +322,17 @@ class SocketServer:
 
     def _format_command_help(self, command_map):
         return "\n".join(
-            f"{command}: {description}"
+            f"[SYS] {command}: {description}"
             for command, description in command_map.items()
         )
+
+    @staticmethod
+    def broadcast_all(socks, message):
+        for sock in list(socks):
+            try:
+                sock.sendall((message + "\n").encode("utf-8"))
+            except OSError:
+                pass
 
     def get_socket_help_message(self, current_server=None):
         socket_commands = {
@@ -335,6 +349,8 @@ class SocketServer:
             "__status": "Show target server process status",
             "__stop": "Stop the target server process",
             "__start": "Start the target server process",
+            "__restart": "Restart the target server process",
+            "__info": "Show server information",
             "<minecraft command>": "Send command to the target Minecraft server process",
         }
 
@@ -355,7 +371,7 @@ class SocketServer:
 
         server_names = sorted(self.command_receivers.keys())
         return "[SYS] Available server shells:\n" + "\n".join(
-            f"- {server_name}" for server_name in server_names
+            f"[SYS] - {server_name}" for server_name in server_names
         )
 
     def handler_command(self, command: str):
@@ -437,7 +453,7 @@ class SocketServer:
     def _build_tcp_server(self):
         manager = self
 
-        class TCPServer(socketserver.ThreadingTCPServer):
+        class TCPServer(ThreadedTCPServer):
             allow_reuse_address = True
             daemon_threads = True
 
@@ -466,6 +482,20 @@ class SocketServer:
                 mgr: Server = self.server.manager
 
                 mgr.logger.info(f"[SYS] Client from {self.client_address[0]}:{self.client_address[1]} connected,")
+                with self.server.clients_lock:
+                    self.server.clients.append(self.request)
+
+            def finish(self):
+                with self.server.clients_lock:
+                    try:
+                        self.server.clients.remove(self.request)
+                    except ValueError:
+                        pass
+                self.current_server_record.pop(
+                    f"{self.client_address[0]}:{self.client_address[1]}",
+                    None,
+                )
+                super().finish()
 
             def handle(self):
                 mgr: Server = self.server.manager
@@ -477,8 +507,15 @@ class SocketServer:
                 def push_logs():
                     while not stop_evt.is_set():
                         try:
-                            line = log_q.get(timeout=0.5)
+                            log_server, line = log_q.get(timeout=0.5)
                         except Exception:
+                            continue
+                        current_server = self.current_server_record.get(
+                            f"{self.client_address[0]}:{self.client_address[1]}",
+                            None,
+                        )
+                        # Only push client connected server's log
+                        if log_server is not None and log_server != current_server:
                             continue
                         try:
                             self.request.sendall(f"[LOG] {line}\n".encode("utf-8"))
@@ -563,6 +600,7 @@ class SocketServer:
                                     self.request.sendall(
                                         f"[SYS] Stopping all servers...bye\n".encode("utf-8")
                                     )
+                                    mgr.broadcast_all(mgr.tcp_server.clients, "[SYS] Server stopping... (Stop by remote client)")
                                     mgr.stop_event.set()
                                     return
                                 elif cmd.startswith("__sync_log"):
@@ -646,26 +684,27 @@ class SocketServer:
         return TCPServer((self.host, self.port), Handler)
 
     def start_socket_server(self):
-        if self._tcp_server:
+        if self.tcp_server:
             print("[SOCK] already running")
             return
 
-        self._tcp_server = self._build_tcp_server()
+        self.tcp_server = self._build_tcp_server()
 
         def loop():
             self.logger.info(f"[SOCK] listening on {self.host}:{self.port}")
-            self._tcp_server.serve_forever(poll_interval=0.5)
+            self.tcp_server.serve_forever(poll_interval=0.5)
 
         self._tcp_thread = threading.Thread(target=loop, daemon=True)
         self._tcp_thread.start()
 
     def stop_socket_server(self):
-        if not self._tcp_server:
+        if not self.tcp_server:
             return
         self.logger.info("[SOCK] shutting down")
-        self._tcp_server.shutdown()
-        self._tcp_server.server_close()
-        self._tcp_server = None
+        self.broadcast_all(self.tcp_server.clients, "[SYS] Server stopping...")
+        self.tcp_server.shutdown()
+        self.tcp_server.server_close()
+        self.tcp_server = None
         if self._tcp_thread and self._tcp_thread.is_alive():
             self._tcp_thread.join(timeout=2)
         self._tcp_thread = None
@@ -940,6 +979,7 @@ class Server:
                           "__stop: Stop the target server process\n"
                           "__start: Start the target server process\n"
                           "__restart: Restart the target server process\n"
+                          "__info: Show target server process status\n"
                           "<minecraft command>: Send command to the target Minecraft server process")
         elif command == "__status":
             with self.proc_lock:
@@ -953,9 +993,15 @@ class Server:
         elif command == "__start":
             self.start()
             return True, f"Server \"{self.name}\" process started"
-        elif command == "__restart":
-            self.restart()
-            return True, f"Server \"{self.name}\" process restarted"
+        elif command == "__info":
+            return True, (f"serverName: {self.name}\n"
+                          f"serverPID: {self.proc.pid}\n"
+                          f"description: {self.description}\n"
+                          f"arguments: {self.args}\n"
+                          f"host: {self.host}\n"
+                          f"port: {self.port}\n"
+                          f"version: {self.version}\n"
+                          f"status: {"Running" if self.is_process_alive() else "Died"}")
         else:
             return False, f"Unknown command: {command}"
 

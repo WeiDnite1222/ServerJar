@@ -3,6 +3,7 @@ import asyncio
 import base64
 import binascii
 import queue
+import re
 import shutil
 import ssl
 import sys
@@ -13,6 +14,7 @@ import traceback
 from pathlib import Path
 from prompt_toolkit import Application
 from prompt_toolkit.layout import Layout, HSplit
+from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
@@ -131,11 +133,51 @@ class ServerJarClient(Application):
 
         # Text style
         self.style = Style.from_dict({
-            "log": "bg:#000000 #ffffff",
             "input": "bg:#222222 #ffffff",
             "separator-area": "bg:#000000 #ffffff",
-            "message-area": "bg:#111111 #ffffff"
+            "message-area": "bg:#111111 #ffffff",
+            "log": "bg:#000000 #ffffff",
+            "warning": "bg:#000000 ansiyellow",
+            "error": "bg:#000000 ansibrightred bold",
+            "system": "bg:#000000 ansicyan",
+            "process-log": "bg:#000000 ansigreen",
+            "process-error": "bg:#000000 ansired",
+            "unknown": "bg:#000000 ansiwhite bold",
         })
+
+        class LogLexer(Lexer):
+            tag_pattern = re.compile(r"^\[([A-Za-z0-9_. -]+)([:|][A-Za-z0-9_. -]+)?\]")
+            line_style = {
+                "auth_err": "class:error",
+                "auth_ok": "class:process-log",
+                "auth_required": "class:warning",
+                "client": "class:log",
+                "client|err": "class:error",
+                "client|warn": "class:warning",
+                "download_log_begin": "class:system",
+                "download_log_end": "class:system",
+                "err": "class:process-error",
+                "log": "class:process-log",
+                "ok": "class:process-log",
+                "sys": "class:system",
+                "sys:err": "class:error",
+                "unknown": "class:unknown",
+            }
+
+            def lex_document(self, document):
+                def get_line(lineno):
+                    line = document.lines[lineno]
+                    match = self.tag_pattern.match(line)
+                    tag = "unknown"
+                    if match:
+                        tag = (match.group(1) + (match.group(2) or "")).lower()
+
+                    style = self.line_style.get(tag, self.line_style["unknown"])
+
+                    return [(style, line)]
+
+                return get_line
+
         # Socket
         self.sock = None
 
@@ -155,6 +197,7 @@ class ServerJarClient(Application):
         self.log_area = TextArea(
             style="class:log",
             wrap_lines=True,
+            lexer=LogLexer(),
         )
 
         self.separator_area = TextArea(text="=" * 10 + " Enter Command Here " + "=" * 10, height=1,
@@ -368,7 +411,7 @@ class ServerJarClient(Application):
 
         def _help(cmd):
             for key, value in cmd_map.items():
-                self._log(f"{key}: {value.get("description")}")
+                self._log(f"{key}: {value.get('description')}")
             return True
 
         def _clear(cmd):
@@ -506,8 +549,15 @@ class ServerJarClient(Application):
     # def clear_screen():
     #     os.system("cls" if os.name == "nt" else "clear")
 
+    @staticmethod
+    def _ensure_log_tag(message):
+        message = f"{message}"
+        if re.match(r"^\[[A-Za-z0-9_. -]+(?:[:|][A-Za-z0-9_. -]+)?\]", message):
+            return message
+        return f"[unknown] {message}"
+
     def log(self, message):
-        self.incoming.put(f"{message}")
+        self.incoming.put(self._ensure_log_tag(message))
 
     def _log(self, message):
         # Nothing change
