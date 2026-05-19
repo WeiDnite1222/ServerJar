@@ -2,11 +2,56 @@ from pathlib import Path
 import requests
 import click
 import os
+from jproperties import Properties
 
 PAPER_VERSION_API = "https://api.papermc.io/v2/projects/paper/versions/{}"
 PAPER_SERVER_JAR_API = "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/paper-{}-{}.jar"
 MOJANG_VERSION_MANIFEST_V2 = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
+def read_server_properties(server_dir: Path) -> Properties:
+    if not server_dir.exists():
+        raise FileNotFoundError("Server directory does not exist")
+
+    props = Properties()
+
+    with open(server_dir / 'server.properties', 'rb') as config_file:
+        props.load(config_file, encoding='utf-8')
+        return props
+
+
+def save_server_properties(properties: Properties, server_dir: Path) -> None:
+    path = server_dir / 'server.properties'
+
+    with path.open("wb") as config_file:
+        properties.store(config_file, encoding='utf-8')
+
+def activate_eula_file(server_dir: Path) -> bool:
+    path = server_dir / 'eula.txt'
+
+    if not path.exists():
+        raise FileNotFoundError("EULA file does not exist. Did you run the server?")
+
+    with open(path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
+
+    for line in lines:
+        print(f"{line}\n")
+
+    print("To activate eula file please read above text. If you agree this license, enter Y [not agree enter N]")
+    result = str(input("Agree? :"))
+
+    if result.strip().lower() != "y":
+        return False
+
+    with open(path, 'w', encoding='utf-8') as file:
+        for line in lines:
+            if line.strip() == "eula=false":
+                file.write("eula=true\n")
+                continue
+            file.write(line)
+
+
+    return True
 
 def jar_filename(filename: str | None, default: str) -> str:
     if filename:

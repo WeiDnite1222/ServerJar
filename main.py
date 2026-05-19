@@ -3,6 +3,7 @@ ServerJar
 
 Wei - 2026
 """
+import platform
 import re
 import signal
 import socketserver
@@ -17,11 +18,14 @@ import time
 import datetime
 import base64
 import hmac
+import ipaddress
+import shlex
 from pathlib import Path
 import click
 import yaml
 from utils.common import get_latest_version_minecraft, get_specific_version_paper_builds, \
-    download_server_jar, download_latest_build_paper_jar, get_latest_paper_version, download_vanilla_server_jar
+    download_server_jar, download_latest_build_paper_jar, get_latest_paper_version, download_vanilla_server_jar, \
+    read_server_properties, save_server_properties, activate_eula_file
 from utils.file_settings import FileSettings
 from utils.file_settings import required_list, required_value
 from cryptography import x509
@@ -89,6 +93,86 @@ def load_settings():
     return s
 
 
+def run_initial_server_start(args, server_dir: Path, timeout: float = 120.0):
+    click.echo("Starting server once to generate initial files...")
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=server_dir,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        click.echo("Initial start is still running. Sending stop command...")
+        try:
+            if proc.stdin:
+                proc.stdin.write("stop\n")
+                proc.stdin.flush()
+        except OSError:
+            pass
+
+        try:
+            output, _ = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            click.echo("Server did not stop in time. Killing initial start process...")
+            proc.kill()
+            output, _ = proc.communicate()
+
+    if output:
+        for line in output.splitlines():
+            click.echo(f"[BOOT] {line}")
+
+    return proc.returncode
+
+
+def configure_initial_server_files(server_dir: Path, server_name: str, server_host: str, server_port: str,
+                                   property_overrides=None):
+    try:
+        properties = read_server_properties(server_dir)
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Unable to read server.properties: {e}", fg="yellow"))
+    else:
+        property_values = {
+            "server-name": str(server_name),
+            "server-ip": str(server_host),
+            "server-port": str(server_port),
+        }
+        if property_overrides:
+            property_values.update(property_overrides)
+
+        for key, value in property_values.items():
+            properties[key] = (value, {})
+
+        save_server_properties(properties, server_dir)
+        click.echo("server.properties updated.")
+
+    try:
+        if activate_eula_file(server_dir):
+            click.echo("EULA activated.")
+        else:
+            click.echo(click.style("EULA was not activated.", fg="yellow"))
+    except FileNotFoundError as e:
+        click.echo(click.style(f"Unable to activate EULA: {e}", fg="yellow"))
+
+
+def parse_server_property_overrides(values):
+    overrides = {}
+    for value in values:
+        key, separator, property_value = value.partition("=")
+        key = key.strip()
+        if separator == "" or key == "":
+            raise click.ClickException(f"Invalid server property override: {value}. Use key=value.")
+        overrides[key] = property_value.strip()
+    return overrides
+
+
 @main.command()
 @click.option("--name", "-d", default="Unnamed Server", show_default=True, help="Server name")
 @click.option("--mc-version", "-m",
@@ -126,10 +210,13 @@ def load_settings():
               help="Hostname of the server", required=True)
 @click.option("--server-port", "-srp",
               help="Port of the server", required=True)
+@click.option("--server-property", "-sp", "server_properties", multiple=True,
+              help="server.properties override written after the first startup. Use key=value; can be repeated.")
 def create_server(name, mc_version, build, server_type, snapshot, latest, list_builds, filename, extra_args, java_exec_path,
-                  x_memory_initial, x_memory_maximum, nogui, custom_args, server_port, server_host):
+                  x_memory_initial, x_memory_maximum, nogui, custom_args, server_port, server_host, server_properties):
     server_dir = Path("servers", name)
     server_type = server_type.lower()
+    property_overrides = parse_server_property_overrides(server_properties)
 
     def prepare_server_dir():
         if server_dir.exists():
@@ -210,21 +297,31 @@ def create_server(name, mc_version, build, server_type, snapshot, latest, list_b
             exit("User aborted.")
             return
 
-    extra_args += "nogui" if nogui else ""
     args = [
         java_exec_path,
         "-Xms{}".format(x_memory_initial),
         "-Xmx{}".format(x_memory_maximum),
         "-jar",
         out.absolute().as_posix(),
-        extra_args,
     ]
+    if extra_args:
+        args.extend(shlex.split(extra_args))
+    if nogui:
+        args.append("nogui")
 
     if custom_args:
         print("Will use custom commands as replacement.")
-        args = custom_args
+        args = shlex.split(custom_args)
 
     print(f"Server command: {' '.join(args)}")
+
+    try:
+        return_code = run_initial_server_start(args, server_dir)
+        if return_code not in (0, None):
+            click.echo(click.style(f"Initial server start exited with code {return_code}.", fg="yellow"))
+        configure_initial_server_files(server_dir, name, server_host, server_port, property_overrides)
+    except Exception as e:
+        raise click.ClickException(f"Unable to bootstrap server files: {e}") from e
 
     with settings.edit() as s:
         print("Saving...")
@@ -292,6 +389,8 @@ class SocketServer:
             self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self._ssl_context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
 
+        self.commands = {}
+
     # -------------------------
     # Socket Server
     # -------------------------
@@ -339,11 +438,12 @@ class SocketServer:
             "__help": "Display this help message",
             "__list": "List available server shells",
             "__exit": "Close the current socket connection",
-            "__stop_all": "Stop all servers and close the socket server",
+            "__stop_all": "Stop all servers and close the socket server (TLS Support must be enabled)",
             "__c <server name>": "Connect to a server shell",
             "__d": "Disconnect from the current server shell",
             "__sync_log [fromDate:endDate]": "Sync saved log lines from the attached server. Empty syncs the latest 300 lines",
             "__download_log": "Download the attached server's saved log file",
+            "__system_info": "Show system information",
         }
         attached_commands = {
             "__status": "Show target server process status",
@@ -597,12 +697,18 @@ class SocketServer:
                                     self.request.sendall(b"[SYS] bye\n")
                                     return
                                 elif cmd == "__stop_all":
-                                    self.request.sendall(
-                                        f"[SYS] Stopping all servers...bye\n".encode("utf-8")
-                                    )
-                                    mgr.broadcast_all(mgr.tcp_server.clients, "[SYS] Server stopping... (Stop by remote client)")
-                                    mgr.stop_event.set()
-                                    return
+                                    if not mgr.enable_tls:
+                                        self.request.sendall(
+                                            f"[SYS] Command \"__stop_all\" only works when tls support is enabled.\n".encode("utf-8")
+                                        )
+                                    else:
+                                        self.request.sendall(
+                                            f"[SYS] Stopping all servers...bye\n".encode("utf-8")
+                                        )
+                                        mgr.broadcast_all(mgr.tcp_server.clients,
+                                                          "[SYS] Server stopping... (Stop by remote client)")
+                                        mgr.stop_event.set()
+                                        return
                                 elif cmd.startswith("__sync_log"):
                                     mgr.send_sync_log(self.request, current_server, cmd)
                                 elif cmd == "__download_log":
@@ -633,6 +739,14 @@ class SocketServer:
                                         f"[SYS] Disconnected from current server \"{current_server}\"'s shell.\n".encode(
                                             "utf-8")
                                     )
+                                elif cmd == "__system_info":
+                                    self.request.sendall(
+                                        f"[SYS] Connected clients number: {len(self.current_server_record)}\n"
+                                        f"[SYS] Hostname: {mgr.host}\n"
+                                        f"[SYS] Port: {mgr.port}\n"
+                                        f"[SYS] Working Directory: {os.getcwd()}\n"
+                                        f"[SYS] Platform: {platform.system()} ({platform.architecture()[0]})\n"
+                                        f"[SYS] Version: {VERSION}\n".encode("utf-8"))
                                 else:
                                     if current_server is not None:
                                         receiver = mgr.get_command_receiver(current_server)
@@ -887,12 +1001,12 @@ class Server:
 
     def _stdout_reader_loop(self):
         self.logger.info("[PROC] stdout reader started")
-        while self.running:
+        while True:
             with self.proc_lock:
                 proc = self.proc
                 out = proc.stdout if proc else None
 
-            if not proc or proc.poll() is not None or not out:
+            if not proc or not out:
                 self.logger.info("[PROC] process ended / stdout closed")
                 break
 
@@ -915,8 +1029,11 @@ class Server:
             if not self.proc.stdin:
                 return False
 
-            self.proc.stdin.write(command + "\n")
-            self.proc.stdin.flush()
+            try:
+                self.proc.stdin.write(command + "\n")
+                self.proc.stdin.flush()
+            except OSError:
+                return False
             return True
 
     def stop_process(self, timeout: float = 10.0):
@@ -959,9 +1076,9 @@ class Server:
             return
 
         self.stopping = True
-        self.running = False
 
         self.stop_process()
+        self.running = False
 
     def restart(self):
         if self.running:
@@ -995,7 +1112,7 @@ class Server:
             return True, f"Server \"{self.name}\" process started"
         elif command == "__info":
             return True, (f"serverName: {self.name}\n"
-                          f"serverPID: {self.proc.pid}\n"
+                          f"serverPID: {self.proc.pid if self.proc else None}\n"
                           f"description: {self.description}\n"
                           f"arguments: {self.args}\n"
                           f"host: {self.host}\n"
@@ -1012,8 +1129,11 @@ class Server:
             if not self.proc.stdin:
                 return False, "Process standard input are not available."
 
-            self.proc.stdin.write(command + "\n")
-            self.proc.stdin.flush()
+            try:
+                self.proc.stdin.write(command + "\n")
+                self.proc.stdin.flush()
+            except OSError as e:
+                return False, f"Unable to write process standard input: {e}"
             return True, "Command sent."
 
 def load_all_server_from_settings(settings: FileSettings):
@@ -1138,7 +1258,8 @@ def runserver(keep_running: bool):
     logger.info("Stopped!")
 
 @main.command()
-def generate_tls_key():
+@click.option("--hostname", default="localhost", show_default=True, help="Hostname or IP address of the server.")
+def generate_tls_key(hostname: str):
     print("Generating TLS key...")
     key = rsa.generate_private_key(
         public_exponent=65537,
@@ -1150,8 +1271,22 @@ def generate_tls_key():
         x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"California"),
         x509.NameAttribute(NameOID.LOCALITY_NAME, u"San Francisco"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"My Dev Org"),
-        x509.NameAttribute(NameOID.COMMON_NAME, u"localhost"),
+        x509.NameAttribute(NameOID.COMMON_NAME, u"{}".format(hostname)),
     ])
+
+    alt_names = [x509.DNSName(u"localhost")]
+
+    def add_alt_name(name):
+        if name not in alt_names:
+            alt_names.append(name)
+
+    try:
+        add_alt_name(x509.IPAddress(ipaddress.ip_address(hostname)))
+    except ValueError:
+        add_alt_name(x509.DNSName(hostname))
+
+    for loopback in ("127.0.0.1", "::1"):
+        add_alt_name(x509.IPAddress(ipaddress.ip_address(loopback)))
 
     cert = x509.CertificateBuilder().subject_name(
         subject
@@ -1167,7 +1302,7 @@ def generate_tls_key():
         # Valid for 1 year
         datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
     ).add_extension(
-        x509.SubjectAlternativeName([x509.DNSName(u"localhost")]),
+        x509.SubjectAlternativeName(alt_names),
         critical=False,
     ).sign(key, hashes.SHA256())
 

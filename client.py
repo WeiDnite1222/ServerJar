@@ -26,7 +26,9 @@ SERVER_JAR_DIR = Path.home() / ".serverjar"
 CLIENT_CERT_DIR = Path.home() / ".serverjar" / "client" / "cert"
 CLIENT_CERT_SUFFIXES = {".pem", ".crt", ".cer"}
 CLIENT_HISTORY_FILE = Path.home() / ".serverjar" / "history" / "history.txt"
+CLIENT_CONNECTION_HISTORY_FILE = Path.home() / ".serverjar" / "history" / "connection_history.txt"
 CLIENT_LOG_DIR = Path.home() / ".serverjar" / "client" / "logs"
+DEFAULT_CONNECT_TIMEOUT = 10.0
 
 def add_client_cert(cert_path):
     source = Path(cert_path).expanduser()
@@ -93,6 +95,68 @@ def create_client_tls_context(log=None, warn=None):
             log(f"No custom TLS certificates found in {CLIENT_CERT_DIR}")
 
     return context
+
+def get_connection_history(log=None, warn=None):
+    connection_history = []
+
+    if not CLIENT_CONNECTION_HISTORY_FILE.exists():
+        return []
+
+    if callable(log):
+        log("Searching existing connections history...")
+
+    try:
+        with CLIENT_CONNECTION_HISTORY_FILE.open(mode="r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    line = line.strip()
+                    if line.count(":") < 2:
+                        continue
+
+                    server_name, host, port = line.rsplit(":", 2)
+
+                    # Ignore unknown format line record
+                    if len(server_name) == 0 or len(host) == 0 or len(port) == 0:
+                        continue
+
+                    int(port)
+
+                    connection_history.append({
+                        "serverName": server_name,
+                        "host": host,
+                        "port": port,
+                    })
+                except ValueError:
+                    continue
+
+    except Exception as e:
+        if callable(warn):
+            warn(f"Unable to load connection history file: {e}")
+
+    return connection_history
+
+
+def save_connection_history(connection_history, log=None, warn=None):
+    if not connection_history:
+        return
+
+    CLIENT_CONNECTION_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if callable(log):
+        log("Saving connection history file...")
+
+    try:
+        with CLIENT_CONNECTION_HISTORY_FILE.open(mode="w", encoding="utf-8") as f:
+            for server in connection_history:
+                server_name = server.get("serverName")
+                host = server.get("host")
+                port = server.get("port")
+                if not server_name or not host or not port:
+                    continue
+                f.write(f"{server_name}:{host}:{port}\n")
+    except Exception as e:
+        if callable(warn):
+            warn(f"Unable to save connection history file: {e}")
 
 
 def get_history(log=None, warn=None):
@@ -227,6 +291,7 @@ class ServerJarClient(Application):
         self.cmds = []
         self.current_index = None
         self.history_draft = ""
+        self.connection_history = []
 
         @self.kb.add("c-c")
         def closing_kb(event):
@@ -426,6 +491,43 @@ class ServerJarClient(Application):
             self._log("History cleared")
             return True
 
+        def _enable_retry_mode(cmd):
+            self.args.retry = True
+            self._log("Auto-retry mode enabled")
+            return True
+
+        def _list_connection_history(cmd):
+            if len(self.connection_history) == 0:
+                self._log("No connection history exists.")
+                return True
+
+            for index, server in enumerate(self.connection_history):
+                self._log("{}: {}".format(index, server.get("serverName")))
+
+            return True
+
+        def _connect_to_record_server(cmd):
+            parts = cmd.split()
+            if len(parts) != 2:
+                self._err("Usage: _hc ${index}")
+                return True
+
+            try:
+                index = int(parts[1])
+                server = self.connection_history[index]
+                host = server.get("host")
+                port = int(server.get("port"))
+                if not host:
+                    raise ValueError("empty host")
+            except (ValueError, TypeError, IndexError):
+                self._err("Invalid index")
+                return True
+
+            connect_to_server(host, port)
+
+            return True
+
+
         cmd_map = {
             "_exit": {
                 "func": _shutdown,
@@ -459,10 +561,23 @@ class ServerJarClient(Application):
                 "func": _clear,
                 "description": "Clear the log area",
             },
+            "_retry": {
+                "func": _enable_retry_mode,
+                "description": "Reconnect to the remote server if connection fails",
+            },
             "_help": {
                 "func": _help,
                 "description": "Display the help message",
             },
+            "_lhc": {
+                "func": _list_connection_history,
+                "description": "List the connection history (Only list the server that have one connection is successful)",
+            }
+            ,
+            "_hc": {
+                "func": _connect_to_record_server,
+                "description": "Connect to the server listed in the connection history. (Usage: _hc ${index})",
+            }
         }
 
         if not command.strip():
@@ -513,6 +628,8 @@ class ServerJarClient(Application):
                             required=False)
         parser.add_argument('-r', '--retry', help="Retry when disconnect", action='store_true', default=False,
                             required=False)
+        parser.add_argument('--connect-timeout', type=float, default=DEFAULT_CONNECT_TIMEOUT,
+                            help="Socket connection timeout in seconds", required=False)
         parser.add_argument('--add-cert', help="Add server certificate", type=str, default=None, required=False)
 
         args = parser.parse_args()
@@ -541,6 +658,7 @@ class ServerJarClient(Application):
 
         # Save history
         save_history(self.cmds, self._log, self._warn)
+        save_connection_history(self.connection_history, self._log, self._warn)
 
         # Exit ui event loop
         self.full_exit()
@@ -600,6 +718,17 @@ class ServerJarClient(Application):
 
             self.invalidate()
 
+    def save_server(self, host, port):
+        for server in self.connection_history:
+            if server.get("host") == host and str(server.get("port")) == str(port):
+                return
+
+        self.connection_history.append({
+            "serverName": f"{host}:{port}",
+            "host": host,
+            "port": port,
+        })
+
     def client(self):
         ptk_clear()
 
@@ -627,10 +756,9 @@ class ServerJarClient(Application):
 
                 # Create connect
                 if self.args.no_tls:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.connect((self.host, self.port))
+                    s = socket.create_connection((self.host, self.port), timeout=self.args.connect_timeout)
                 else:
-                    raw = socket.create_connection((self.host, self.port))
+                    raw = socket.create_connection((self.host, self.port), timeout=self.args.connect_timeout)
                     context = self.get_tls_context()
                     s = context.wrap_socket(raw, server_hostname=self.host)
 
@@ -649,6 +777,10 @@ class ServerJarClient(Application):
                     data = s.recv(4096)
                     if not data:
                         raise ConnectionError("Server closed")
+
+                    # Only save the server that have at least one connection is successful
+                    self.save_server(self.host, self.port)
+
                     buffer += data.decode("utf-8", errors="replace")
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
@@ -721,7 +853,7 @@ class ServerJarClient(Application):
 
             except (ConnectionError, OSError) as e:
                 if not self.closing_event.is_set():
-                    if self.args.retry:
+                    if self.args.retry and self.host is not None and self.port is not None:
                         self._warn(f"Disconnected: {e}, retrying...")
                     else:
                         self._err(f"Disconnected: {e}")
@@ -757,6 +889,7 @@ class ServerJarClient(Application):
         self.args = self.arguments_parser()
         self.layout.focus(self.input_area)
         self.cmds = get_history(self._log, self._warn)
+        self.connection_history = get_connection_history(self._log, self._warn)
         asyncio.create_task(self.consume_incoming())
 
         self.client_thread.start()
