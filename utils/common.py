@@ -8,6 +8,7 @@ PAPER_VERSION_API = "https://api.papermc.io/v2/projects/paper/versions/{}"
 PAPER_SERVER_JAR_API = "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/paper-{}-{}.jar"
 MOJANG_VERSION_MANIFEST_V2 = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
+
 def read_server_properties(server_dir: Path) -> Properties:
     if not server_dir.exists():
         raise FileNotFoundError("Server directory does not exist")
@@ -25,6 +26,7 @@ def save_server_properties(properties: Properties, server_dir: Path) -> None:
     with path.open("wb") as config_file:
         properties.store(config_file, encoding='utf-8')
 
+
 def activate_eula_file(server_dir: Path) -> bool:
     path = server_dir / 'eula.txt'
 
@@ -35,7 +37,7 @@ def activate_eula_file(server_dir: Path) -> bool:
         lines = file.readlines()
 
     for line in lines:
-        print(f"{line}\n")
+        print(f"{line}")
 
     print("To activate eula file please read above text. If you agree this license, enter Y [not agree enter N]")
     result = str(input("Agree? :"))
@@ -50,8 +52,8 @@ def activate_eula_file(server_dir: Path) -> bool:
                 continue
             file.write(line)
 
-
     return True
+
 
 def jar_filename(filename: str | None, default: str) -> str:
     if filename:
@@ -179,6 +181,25 @@ def get_latest_version_minecraft(release=True):
     return ver
 
 
+def get_specific_version_minecraft_require_java_version(minecraft_version, release=True):
+    version_list = get_version_list(release=release)
+
+    if release:
+        version_exists = minecraft_version in version_list
+    else:
+        version_exists = any(version.get("id") == minecraft_version for version in version_list)
+
+    if not version_exists:
+        raise Exception("Specified Minecraft version does not exist.")
+
+    metadata = get_minecraft_version_metadata(minecraft_version)
+
+    if not metadata:
+        raise Exception("Unable to get Minecraft version metadata for {}.\n".format(minecraft_version))
+
+    return metadata.get("javaVersion", {}).get("majorVersion", None)
+
+
 def download_server_jar(minecraft_version: str, build_version: str, destination: Path, filename: str | None = None):
     """
     Download server jar (paper server only)
@@ -194,7 +215,8 @@ def download_server_jar(minecraft_version: str, build_version: str, destination:
         download_file(url, destination)
         return destination
     except Exception as e:
-        raise Exception("Unable to download server jar for version {}\nURL: {}\nError: {}".format(minecraft_version, url, e))
+        raise Exception(
+            "Unable to download server jar for version {}\nURL: {}\nError: {}".format(minecraft_version, url, e))
 
 
 def get_latest_build_of_version(minecraft_version: str) -> str:
@@ -208,6 +230,7 @@ def get_latest_build_of_version(minecraft_version: str) -> str:
 def download_latest_build_paper_jar(minecraft_version: str, destination_dir: Path, filename: str | None = None):
     build = get_latest_build_of_version(minecraft_version)
     return download_server_jar(minecraft_version, build, destination_dir, filename=filename)
+
 
 def version_exist_from_paper(minecraft_version: str) -> bool:
     try:
@@ -223,14 +246,14 @@ def get_latest_paper_version(release) -> str:
     latest_paper_support_ver = None
 
     while latest_paper_support_ver is None:
-        if len(vers) < index+1:
+        if len(vers) < index + 1:
             raise Exception("No supported Minecraft version available for Paper support.")
 
         if version_exist_from_paper(minecraft_version=vers[index]):
             latest_paper_support_ver = vers[index]
             break
 
-        index+=1
+        index += 1
 
     return latest_paper_support_ver
 
@@ -273,3 +296,53 @@ def download_vanilla_server_jar(minecraft_version: str, destination: Path, filen
             url,
             e,
         ))
+
+def find_system_java_executables(java_names):
+    """
+    Find system Java executables
+    :param java_names:
+    :return:
+    """
+    roots = []
+    if os.name == "nt":
+        for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
+            root = os.environ.get(env_name)
+            if root:
+                roots.append(os.path.join(root, "Java"))
+    elif os.name == "posix":
+        roots.extend(("/Library/Java/JavaVirtualMachines", "/opt/java", "/usr/lib/jvm", "/usr/local/java"))
+
+    found = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+
+        for current_root, _, files in os.walk(root):
+            for java_name in java_names:
+                if java_name in files and os.path.basename(current_root).lower() == "bin":
+                    found.append(os.path.join(current_root, java_name))
+                    break
+
+    return found
+
+def major_version_from_runtime_dir(runtime_dir):
+    """
+    Get major version from target runtime directory
+    (Only works if this runtime is created by launcher)
+    :param runtime_dir:
+    :return:
+    """
+    name = runtime_dir.name
+    if name.lower().startswith("java_"):
+        return name.split("_", 1)[1]
+
+    info_path = runtime_dir / "java.version.info"
+    if info_path.exists():
+        try:
+            for line in info_path.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("JavaMajorVersion") and "=" in line:
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            return ""
+
+    return ""

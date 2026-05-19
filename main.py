@@ -25,9 +25,13 @@ import click
 import yaml
 from utils.common import get_latest_version_minecraft, get_specific_version_paper_builds, \
     download_server_jar, download_latest_build_paper_jar, get_latest_paper_version, download_vanilla_server_jar, \
-    read_server_properties, save_server_properties, activate_eula_file
+    read_server_properties, save_server_properties, activate_eula_file, \
+    get_specific_version_minecraft_require_java_version, find_system_java_executables
+from utils.explorer_library import get_java_version_by_execute, search_available_java_runtimes_in_directory
 from utils.file_settings import FileSettings
 from utils.file_settings import required_list, required_value
+from utils.java.java_info import create_java_version_info
+from utils.java.jvm_installer import install_azul_build_version_jvm
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
@@ -40,6 +44,7 @@ VERSION = "1.1"
 LOG_DIR_NAME = "logs"
 SERVERJAR_LOG_FILE = "serverjar.log"
 LOG_DOWNLOAD_CHUNK_SIZE = 4096
+JVM_RUNTIME_DIR = ROOT_DIR / "data" / "jvm"
 
 def exit(message):
     click.echo(click.style(message, fg='green'))
@@ -173,6 +178,159 @@ def parse_server_property_overrides(values):
     return overrides
 
 
+def normalize_machine_arch(machine=None):
+    machine = (machine or platform.machine()).lower()
+    if machine in ("amd64", "x86_64", "x64"):
+        return "amd64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    if machine in ("x86", "i386", "i686"):
+        return "i686"
+    return machine
+
+
+def java_executable_names():
+    return ["java.exe", "javaw.exe"] if os.name == "nt" else ["java"]
+
+
+def java_runtime_search_roots():
+    roots = [JVM_RUNTIME_DIR]
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        roots.append(Path(java_home))
+    return roots
+
+
+def collect_java_executable_candidates():
+    candidates = []
+
+    for root in java_runtime_search_roots():
+        if root.exists():
+            candidates.extend(search_available_java_runtimes_in_directory(str(root)))
+
+    candidates.extend(find_system_java_executables(java_executable_names()))
+
+    for java_name in java_executable_names():
+        candidates.append(java_name)
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        candidate_key = str(candidate).lower()
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        unique_candidates.append(str(candidate))
+
+    return unique_candidates
+
+
+def inspect_java_candidate(java_executable_path):
+    status, major_version, error = get_java_version_by_execute(java_executable_path)
+    if not status:
+        return None, error
+
+    try:
+        major_version = int(major_version)
+    except (TypeError, ValueError):
+        return None, f"Invalid Java major version: {major_version}"
+
+    return major_version, None
+
+
+def find_compatible_java(required_major_version):
+    required_major_version = int(required_major_version)
+    compatible = []
+    checked = []
+
+    for candidate in collect_java_executable_candidates():
+        major_version, error = inspect_java_candidate(candidate)
+        if major_version is None:
+            checked.append((candidate, None, error))
+            continue
+
+        checked.append((candidate, major_version, None))
+        if major_version >= required_major_version:
+            compatible.append((candidate, major_version))
+
+    compatible.sort(key=lambda item: (item[1], item[0]))
+    if compatible:
+        return compatible[0][0], compatible[0][1], checked
+
+    return None, None, checked
+
+
+def install_compatible_java(required_major_version):
+    arch = normalize_machine_arch()
+    platform_name = platform.system().lower()
+    install_dir = JVM_RUNTIME_DIR / f"java_{required_major_version}_{arch}"
+
+    click.echo(f"Installing Azul Java {required_major_version} into {install_dir} ...")
+    status, error = install_azul_build_version_jvm(
+        str(required_major_version),
+        str(install_dir),
+        arch,
+        platform_name,
+    )
+    if not status:
+        raise click.ClickException(f"Unable to install Azul Java {required_major_version}: {error}")
+
+    create_java_version_info(str(required_major_version), arch, str(install_dir))
+    java_executable = install_dir / "bin" / ("java.exe" if os.name == "nt" else "java")
+    if not java_executable.exists():
+        raise click.ClickException(f"Installed JVM does not contain a Java executable: {java_executable}")
+
+    return java_executable.absolute().as_posix()
+
+
+def resolve_java_executable(java_exec_path, minecraft_version, release, auto_install_java):
+    required_major_version = get_specific_version_minecraft_require_java_version(minecraft_version, release=release)
+    if required_major_version is None:
+        click.echo(click.style("Unable to determine required Java version. Using configured Java executable.", fg="yellow"))
+        return java_exec_path or "java"
+
+    click.echo(f"Minecraft {minecraft_version} requires Java {required_major_version}.")
+
+    if java_exec_path:
+        major_version, error = inspect_java_candidate(java_exec_path)
+        if major_version is None:
+            raise click.ClickException(f"Unable to use Java executable '{java_exec_path}': {error}")
+        if major_version < int(required_major_version):
+            raise click.ClickException(
+                f"Java executable '{java_exec_path}' is Java {major_version}, "
+                f"but Minecraft {minecraft_version} requires Java {required_major_version}."
+            )
+        click.echo(f"Using configured Java executable: {java_exec_path} (Java {major_version})")
+        return java_exec_path
+
+    java_path, major_version, checked = find_compatible_java(required_major_version)
+    if java_path:
+        click.echo(f"Using compatible Java executable: {java_path} (Java {major_version})")
+        return java_path
+
+    click.echo(click.style(f"No compatible Java runtime found for Java {required_major_version}.", fg="yellow"))
+    if checked:
+        click.echo("Checked Java candidates:")
+        for candidate, candidate_major, error in checked:
+            if candidate_major is None:
+                click.echo(f"- {candidate}: unavailable ({error})")
+            else:
+                click.echo(f"- {candidate}: Java {candidate_major}")
+
+    should_install = auto_install_java
+    if not should_install:
+        result = input("Install a compatible Azul JVM now? [y/N] ")
+        should_install = result.strip().lower() == "y"
+
+    if should_install:
+        return install_compatible_java(required_major_version)
+
+    raise click.ClickException(
+        f"No compatible Java runtime is available. Install Java {required_major_version}+ "
+        "or rerun with --install-java."
+    )
+
+
 @main.command()
 @click.option("--name", "-d", default="Unnamed Server", show_default=True, help="Server name")
 @click.option("--mc-version", "-m",
@@ -196,7 +354,10 @@ def parse_server_property_overrides(values):
 @click.option("--custom-args", "-ce",
               help="Custom arguments (command)", type=str, default="")
 @click.option("--java-exec-path", "-p", show_default=True,
-              help="The destination of the java executable", default="java")
+              help="The destination of the java executable. If omitted, ServerJar searches for a compatible Java.",
+              default=None)
+@click.option("--install-java", is_flag=True,
+              help="Install a compatible Azul JVM automatically when no local compatible Java is found.")
 @click.option("--x-memory-initial", "-xms", show_default=True,
               help="Initial allocation size of the memory for server",
               type=str, default="1G")
@@ -213,7 +374,8 @@ def parse_server_property_overrides(values):
 @click.option("--server-property", "-sp", "server_properties", multiple=True,
               help="server.properties override written after the first startup. Use key=value; can be repeated.")
 def create_server(name, mc_version, build, server_type, snapshot, latest, list_builds, filename, extra_args, java_exec_path,
-                  x_memory_initial, x_memory_maximum, nogui, custom_args, server_port, server_host, server_properties):
+                  install_java, x_memory_initial, x_memory_maximum, nogui, custom_args, server_port, server_host,
+                  server_properties):
     server_dir = Path("servers", name)
     server_type = server_type.lower()
     property_overrides = parse_server_property_overrides(server_properties)
@@ -297,8 +459,12 @@ def create_server(name, mc_version, build, server_type, snapshot, latest, list_b
             exit("User aborted.")
             return
 
+    selected_mc_version = latest_ver if latest_ver is not None else mc_version
+    if not custom_args:
+        java_exec_path = resolve_java_executable(java_exec_path, selected_mc_version, release, install_java)
+
     args = [
-        java_exec_path,
+        java_exec_path or "java",
         "-Xms{}".format(x_memory_initial),
         "-Xmx{}".format(x_memory_maximum),
         "-jar",
