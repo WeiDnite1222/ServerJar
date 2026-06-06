@@ -1008,6 +1008,16 @@ class SocketServer:
                 except (ConnectionResetError, OSError):
                     mgr.logger.info(
                         "[SYS] Client disconnected. From {}:{}".format(self.client_address[0], self.client_address[1]))
+                except Exception as e:
+                    mgr.logger.exception(
+                        "[SYS] Client handler error. From %s:%s",
+                        self.client_address[0],
+                        self.client_address[1],
+                    )
+                    try:
+                        self.request.sendall(f"[SYS:ERR] Server handler error: {e}\n".encode("utf-8"))
+                    except OSError:
+                        pass
                 finally:
                     stop_evt.set()
                     if log_q is not None:

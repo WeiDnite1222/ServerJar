@@ -762,6 +762,10 @@ class ServerJarClient(Application):
                     context = self.get_tls_context()
                     s = context.wrap_socket(raw, server_hostname=self.host)
 
+                # The connection timeout should not become an idle read timeout.
+                # Keep recv() blocking so quiet but healthy connections stay open.
+                s.settimeout(None)
+
                 with self.sock_lock:
                     self.sock = s
 
