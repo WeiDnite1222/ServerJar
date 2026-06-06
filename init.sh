@@ -6,5 +6,8 @@ else
     exit 1
 fi
 
-uv venv
+
+if [ ! -d "$DIR" ]; then
+    uv venv
+fi
 uv pip install -r requirements.txt

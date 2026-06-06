@@ -1,3 +1,7 @@
+if [ ! -d "$DIR" ]; then
+    uv venv
+fi
+
 echo "Checking environment..."
 if command -v nuitka &> /dev/null; then
     echo "Nuitka installed"
