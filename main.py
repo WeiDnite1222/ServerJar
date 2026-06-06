@@ -82,7 +82,7 @@ def load_settings():
                     "workDir": "",
                     "port": 25565,
                     "host": "127.0.0.1",
-                    "enable": True
+                    "enable": True,
                 },
                 use_same_form=True,
             )
@@ -417,9 +417,10 @@ def resolve_java_executable(java_exec_path, minecraft_version, release, auto_ins
               help="Port of the server", required=True)
 @click.option("--server-property", "-sp", "server_properties", multiple=True,
               help="server.properties override written after the first startup. Use key=value; can be repeated.")
+@click.option("--order", "-o", help="Startup order when starting the server", type=int, default=None)
 def create_server(name, mc_version, build, server_type, snapshot, latest, list_builds, filename, extra_args, java_exec_path,
                   install_java, x_memory_initial, x_memory_maximum, nogui, custom_args, server_port, server_host,
-                  server_properties):
+                  server_properties, order):
     server_dir = Path("servers", name)
     server_type = server_type.lower()
     property_overrides = parse_server_property_overrides(server_properties)
@@ -550,6 +551,7 @@ def create_server(name, mc_version, build, server_type, snapshot, latest, list_b
             "port": server_port,
             "host": server_host,
             "enable": True,
+            "order": order
         })
 
     print("Done")
@@ -1356,16 +1358,22 @@ def load_all_server_from_settings(settings: FileSettings):
     servers = []
     with settings.edit() as s:
         for server_conf in s.get("servers", []):
-            servers.append(Server(
-                name=server_conf.get("name"),
-                version=server_conf.get("version"),
-                description=server_conf.get("description"),
-                args=server_conf.get("args",[]),
-                work_dir=server_conf.get("workDir"),
-                port=server_conf.get("port"),
-                host=server_conf.get("host"),
-                enable=server_conf.get("enable")
-            ))
+            order = server_conf.get("order", None)
+            server = Server(
+                    name=server_conf.get("name"),
+                    version=server_conf.get("version"),
+                    description=server_conf.get("description"),
+                    args=server_conf.get("args", []),
+                    work_dir=server_conf.get("workDir"),
+                    port=server_conf.get("port"),
+                    host=server_conf.get("host"),
+                    enable=server_conf.get("enable")
+                )
+
+            if order is None or order-1<0:
+                servers.append(server)
+            else:
+                servers.insert(order-1, server)
 
     return servers
 
