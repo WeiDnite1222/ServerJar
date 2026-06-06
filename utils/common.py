@@ -37,6 +37,10 @@ def activate_eula_file(server_dir: Path) -> bool:
         lines = file.readlines()
 
     for line in lines:
+        if line.strip() == "eula=true":
+            print("EULA file has been activated.")
+            return True
+
         print(f"{line}")
 
     print("To activate eula file please read above text. If you agree this license, enter Y [not agree enter N]")

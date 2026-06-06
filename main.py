@@ -20,6 +20,7 @@ import base64
 import hmac
 import ipaddress
 import shlex
+import shutil
 from pathlib import Path
 import click
 import yaml
@@ -225,39 +226,72 @@ def collect_java_executable_candidates():
     return unique_candidates
 
 
+def resolve_executable_path(executable_path):
+    resolved = shutil.which(str(executable_path))
+    if resolved:
+        return Path(resolved)
+    return Path(executable_path)
+
+
+def is_x86_directory_java(executable_path):
+    path = resolve_executable_path(executable_path)
+    return any("(x86)" in part.lower() for part in path.parts)
+
+
+def parse_memory_size_to_mb(value):
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmgtKMGT]?)\s*", str(value))
+    if not match:
+        raise click.ClickException(f"Invalid memory size: {value}")
+
+    amount = float(match.group(1))
+    unit = match.group(2).upper() or "M"
+    multiplier = {
+        "K": 1 / 1024,
+        "M": 1,
+        "G": 1024,
+        "T": 1024 * 1024,
+    }[unit]
+    return amount * multiplier
+
+
 def inspect_java_candidate(java_executable_path):
     status, major_version, error = get_java_version_by_execute(java_executable_path)
     if not status:
-        return None, error
+        return None, error, is_x86_directory_java(java_executable_path)
 
     try:
         major_version = int(major_version)
     except (TypeError, ValueError):
-        return None, f"Invalid Java major version: {major_version}"
+        return None, f"Invalid Java major version: {major_version}", is_x86_directory_java(java_executable_path)
 
-    return major_version, None
+    return major_version, None, is_x86_directory_java(java_executable_path)
 
 
-def find_compatible_java(required_major_version):
+def find_compatible_java(required_major_version, max_memory_mb):
     required_major_version = int(required_major_version)
     compatible = []
     checked = []
+    avoid_32bit = max_memory_mb >= 4096
 
     for candidate in collect_java_executable_candidates():
-        major_version, error = inspect_java_candidate(candidate)
+        major_version, error, is_32bit = inspect_java_candidate(candidate)
         if major_version is None:
-            checked.append((candidate, None, error))
+            checked.append((candidate, None, is_32bit, error))
             continue
 
-        checked.append((candidate, major_version, None))
+        if is_32bit and avoid_32bit:
+            checked.append((candidate, major_version, is_32bit, "Skipped 32-bit Java because Xmx is 4G or higher."))
+            continue
+
+        checked.append((candidate, major_version, is_32bit, None))
         if major_version >= required_major_version:
-            compatible.append((candidate, major_version))
+            compatible.append((candidate, major_version, is_32bit))
 
     compatible.sort(key=lambda item: (item[1], item[0]))
     if compatible:
-        return compatible[0][0], compatible[0][1], checked
+        return compatible[0][0], compatible[0][1], compatible[0][2], checked
 
-    return None, None, checked
+    return None, None, None, checked
 
 
 def install_compatible_java(required_major_version):
@@ -283,7 +317,8 @@ def install_compatible_java(required_major_version):
     return java_executable.absolute().as_posix()
 
 
-def resolve_java_executable(java_exec_path, minecraft_version, release, auto_install_java):
+def resolve_java_executable(java_exec_path, minecraft_version, release, auto_install_java, x_memory_maximum):
+    max_memory_mb = parse_memory_size_to_mb(x_memory_maximum)
     required_major_version = get_specific_version_minecraft_require_java_version(minecraft_version, release=release)
     if required_major_version is None:
         click.echo(click.style("Unable to determine required Java version. Using configured Java executable.", fg="yellow"))
@@ -292,30 +327,39 @@ def resolve_java_executable(java_exec_path, minecraft_version, release, auto_ins
     click.echo(f"Minecraft {minecraft_version} requires Java {required_major_version}.")
 
     if java_exec_path:
-        major_version, error = inspect_java_candidate(java_exec_path)
+        major_version, error, is_32bit = inspect_java_candidate(java_exec_path)
         if major_version is None:
             raise click.ClickException(f"Unable to use Java executable '{java_exec_path}': {error}")
+        if is_32bit and max_memory_mb >= 4096:
+            raise click.ClickException(
+                f"Java executable '{java_exec_path}' is in an (x86) directory and is treated as 32-bit. "
+                f"It cannot be used with -Xmx{x_memory_maximum}; use less than 4G, or choose a 64-bit Java."
+            )
         if major_version < int(required_major_version):
             raise click.ClickException(
                 f"Java executable '{java_exec_path}' is Java {major_version}, "
                 f"but Minecraft {minecraft_version} requires Java {required_major_version}."
             )
-        click.echo(f"Using configured Java executable: {java_exec_path} (Java {major_version})")
+        bitness = ", 32-bit path" if is_32bit else ""
+        click.echo(f"Using configured Java executable: {java_exec_path} (Java {major_version}{bitness})")
         return java_exec_path
 
-    java_path, major_version, checked = find_compatible_java(required_major_version)
+    java_path, major_version, is_32bit, checked = find_compatible_java(required_major_version, max_memory_mb)
     if java_path:
-        click.echo(f"Using compatible Java executable: {java_path} (Java {major_version})")
+        bitness = ", 32-bit path" if is_32bit else ""
+        click.echo(f"Using compatible Java executable: {java_path} (Java {major_version}{bitness})")
         return java_path
 
     click.echo(click.style(f"No compatible Java runtime found for Java {required_major_version}.", fg="yellow"))
     if checked:
         click.echo("Checked Java candidates:")
-        for candidate, candidate_major, error in checked:
+        for candidate, candidate_major, is_32bit, error in checked:
+            bitness = ", 32-bit path" if is_32bit else ""
             if candidate_major is None:
-                click.echo(f"- {candidate}: unavailable ({error})")
+                click.echo(f"- {candidate}: unavailable{bitness} ({error})")
             else:
-                click.echo(f"- {candidate}: Java {candidate_major}")
+                suffix = f" ({error})" if error else ""
+                click.echo(f"- {candidate}: Java {candidate_major}{bitness}{suffix}")
 
     should_install = auto_install_java
     if not should_install:
@@ -416,7 +460,7 @@ def create_server(name, mc_version, build, server_type, snapshot, latest, list_b
         else:
             if mc_version is None:
                 click.echo("The mc-version is not specified. Fetching latest Minecraft release version...")
-                mc_version = get_latest_version_minecraft(release=release)
+                mc_version = get_latest_paper_version(release=release)
 
             if list_builds:
                 builds = get_specific_version_paper_builds(mc_version)
@@ -461,7 +505,13 @@ def create_server(name, mc_version, build, server_type, snapshot, latest, list_b
 
     selected_mc_version = latest_ver if latest_ver is not None else mc_version
     if not custom_args:
-        java_exec_path = resolve_java_executable(java_exec_path, selected_mc_version, release, install_java)
+        java_exec_path = resolve_java_executable(
+            java_exec_path,
+            selected_mc_version,
+            release,
+            install_java,
+            x_memory_maximum,
+        )
 
     args = [
         java_exec_path or "java",
