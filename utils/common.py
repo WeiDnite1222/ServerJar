@@ -1,11 +1,13 @@
+import hashlib
+import warnings
 from pathlib import Path
 import requests
 import click
 import os
 from jproperties import Properties
 
-PAPER_VERSION_API = "https://api.papermc.io/v2/projects/paper/versions/{}"
-PAPER_SERVER_JAR_API = "https://api.papermc.io/v2/projects/paper/versions/{}/builds/{}/downloads/paper-{}-{}.jar"
+PAPER_VERSION_API = "https://fill.papermc.io/v3/projects/paper/versions/{}"
+PAPER_BUILD_API = "https://fill.papermc.io/v3/projects/paper/versions/{}/builds/{}"
 MOJANG_VERSION_MANIFEST_V2 = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
 
@@ -69,7 +71,7 @@ def jar_filename(filename: str | None, default: str) -> str:
     return default
 
 
-def download_file(url: str, destination: Path, chunk_size: int = 1024 * 512):
+def download_file(url: str, destination: Path, chunk_size: int = 1024 * 512, sha256=None):
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     with requests.get(url, stream=True, timeout=30) as r:
@@ -91,6 +93,19 @@ def download_file(url: str, destination: Path, chunk_size: int = 1024 * 512):
                     if chunk:
                         f.write(chunk)
 
+    if sha256:
+        sha256_hash = hashlib.sha256()
+
+        with destination.open(mode="rb", buffering=chunk_size) as f:
+            for chunk in iter(lambda: f.read(chunk_size), b""):
+                sha256_hash.update(chunk)
+
+        hexdigest = sha256_hash.hexdigest()
+
+        if hexdigest == sha256:
+            click.echo(f"File {os.path.basename(destination)} verified.")
+        else:
+            raise RuntimeError(f"Download {os.path.basename(destination)} failed. Hash does not match.")
 
 def get_specific_version_paper_builds(minecraft_version: str) -> list[dict[str, str]]:
     """
@@ -203,24 +218,41 @@ def get_specific_version_minecraft_require_java_version(minecraft_version, relea
 
     return metadata.get("javaVersion", {}).get("majorVersion", None)
 
+def get_paper_server_jar_info(minecraft_version: str, build_version: str):
+    url = PAPER_BUILD_API.format(minecraft_version, build_version)
+
+    try:
+        r = requests.get(url)
+        if r.status_code == 200:
+            return r.json().get("downloads", {}).get("server:default", None)
+        else:
+            raise Exception(f"Unable to fetch paper server jar information. (VER:{minecraft_version},BUILD:{build_version})\n")
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Unable to get paper version information. Exec: {e}\n")
 
 def download_server_jar(minecraft_version: str, build_version: str, destination: Path, filename: str | None = None):
     """
     Download server jar (paper server only)
     """
-    url = PAPER_SERVER_JAR_API.format(minecraft_version, build_version, minecraft_version, build_version)
+    data = get_paper_server_jar_info(minecraft_version, build_version)
 
-    jar_name = jar_filename(filename, os.path.basename(url))
+    download_url = data.get("url", None)
+    sha256 = data.get("checksums", {}).get("sha256", None)
+
+    jar_name = jar_filename(filename, os.path.basename(download_url))
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination = Path(destination, jar_name)
 
+    if not sha256:
+        warnings.warn("Unable to verify server jar due to hash from server is invalid.", UserWarning)
+
     try:
-        download_file(url, destination)
+        download_file(download_url, destination, sha256=sha256)
         return destination
     except Exception as e:
         raise Exception(
-            "Unable to download server jar for version {}\nURL: {}\nError: {}".format(minecraft_version, url, e))
+            "Unable to download server jar for version {}\nURL: {}\nError: {}".format(minecraft_version, download_url, e))
 
 
 def get_latest_build_of_version(minecraft_version: str) -> str:
