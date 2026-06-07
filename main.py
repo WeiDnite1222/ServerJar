@@ -1347,6 +1347,9 @@ class Server:
                           f"port: {self.port}\n"
                           f"version: {self.version}\n"
                           f"status: {"Running" if self.is_process_alive() else "Died"}")
+        elif command == "__restart":
+            self.restart()
+            return True, f"Server \"{self.name}\" process restarted"
         else:
             return False, f"Unknown command: {command}"
 
