@@ -41,7 +41,7 @@ from cryptography.hazmat.primitives import serialization
 
 ROOT_DIR = Path(os.getcwd())
 SERVER_CONFIG_PATH = ROOT_DIR / "config" / "server.yml"
-VERSION = "1.1"
+VERSION = "1.2"
 LOG_DIR_NAME = "logs"
 SERVERJAR_LOG_FILE = "serverjar.log"
 LOG_DOWNLOAD_CHUNK_SIZE = 4096
